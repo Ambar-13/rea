@@ -32,9 +32,9 @@ import {
   symbolicUnion,
   symbolicUnknown,
   symbolicVariants,
-  symbolicConditionsUnresolved,
   symbolicTruth,
   type SymbolicCondition,
+  type SymbolicMetadata,
   type SymbolicValue,
   type SymbolicEnvironment,
   type SymbolicFunction,
@@ -45,10 +45,12 @@ interface PropertyWrite {
   readonly value: t.Node;
   readonly site: t.Node;
 }
-interface SymbolicReturnFlow {
+interface SymbolicReturnFlow extends SymbolicMetadata {
   readonly values: readonly SymbolicValue[];
   readonly fallsThrough: boolean;
 }
+type SymbolicNamespace = Extract<SymbolicValue, { kind: "namespace" }>;
+
 const emptyEnvironment: SymbolicEnvironment = { values: new Map() };
 const isObjectPrototypeSetter = (
   property: t.ObjectMethod | t.ObjectProperty,
@@ -82,7 +84,10 @@ export class JavaScriptSymbolicBindings {
   readonly #activeFunctions = new Set<t.Function>();
   readonly #exportAliases = new Map<string, string>();
   readonly #moduleBindings = new Set<string>();
-  readonly #replacements = new Map<string, t.Node>();
+  readonly #completedModules = new WeakMap<
+    SymbolicEnvironment,
+    SymbolicValue
+  >();
   readonly #propertyActive = new WeakMap<object, Set<string>>();
   readonly #literalPropertyIndex = new WeakMap<
     t.ObjectExpression,
@@ -189,6 +194,41 @@ export class JavaScriptSymbolicBindings {
     }
   }
 
+  #withConditions(
+    value: SymbolicValue,
+    source: SymbolicMetadata,
+  ): SymbolicValue {
+    const conditions = source.conditions ?? [];
+    if (conditions.length === 0 && !source.conditionUnresolved) return value;
+    const variants = symbolicVariants(value);
+    // Charge the representation expansion before allocating copies. A long
+    // sequence of early exits otherwise builds unbounded predicate prefixes.
+    for (const variant of variants) {
+      const cost =
+        1 +
+        (conditions.length
+          ? conditions.length + (variant.conditions?.length ?? 0)
+          : 0);
+      if (cost > this.#remainingEvaluations) {
+        this.#remainingEvaluations = 0;
+        this.truncated = true;
+        return symbolicUnknown("symbolic condition resource limit");
+      }
+      this.#remainingEvaluations -= cost;
+    }
+    return symbolicUnion(
+      variants.map((variant) => ({
+        ...variant,
+        ...(conditions.length
+          ? { conditions: [...(variant.conditions ?? []), ...conditions] }
+          : {}),
+        ...(source.conditionUnresolved
+          ? { conditionUnresolved: true as const }
+          : {}),
+      })),
+    );
+  }
+
   property(value: SymbolicValue, key: string): SymbolicValue {
     let result: SymbolicValue;
     if (value.kind === "union")
@@ -196,11 +236,7 @@ export class JavaScriptSymbolicBindings {
         value.values.map((variant) => this.property(variant, key)),
       );
     else result = this.#property(value, key);
-    for (const condition of value.conditions ?? [])
-      result = symbolicCondition(result, condition);
-    if (value.conditionUnresolved)
-      result = symbolicConditionsUnresolved(result);
-    return result;
+    return this.#withConditions(result, value);
   }
 
   #property(value: SymbolicValue, key: string): SymbolicValue {
@@ -234,13 +270,16 @@ export class JavaScriptSymbolicBindings {
         this.#unsafeExports.has(`${value.bindingId}:${key}`)
       )
         return symbolicUnknown("ambiguous export writes");
-      const replacement = this.#replacements.get(value.bindingId);
+      const available = this.#namespaceWrites(value);
+      const replacement = available.findLast(
+        (write) => write.path.length === 0,
+      );
       if (replacement)
         return this.property(
-          this.evaluate(replacement, value.environment),
+          this.evaluate(replacement.value, value.environment),
           key,
         );
-      const writes = (this.#writes.get(value.bindingId) ?? []).filter(
+      const writes = available.filter(
         (w) => w.path.length === 1 && w.path[0] === key,
       );
       const write = writes.at(-1);
@@ -332,14 +371,18 @@ export class JavaScriptSymbolicBindings {
       return [...new Set(value.values.flatMap((v) => this.members(v, active)))];
     if (value.kind === "record") return [...value.values.keys()];
     if (value.kind === "namespace") {
-      const replacement = this.#replacements.get(value.bindingId);
+      const available = this.#namespaceWrites(value);
+      const replacement = available.findLast(
+        (write) => write.path.length === 0,
+      );
       return replacement
-        ? this.members(this.evaluate(replacement, value.environment), active)
+        ? this.members(
+            this.evaluate(replacement.value, value.environment),
+            active,
+          )
         : [
             ...new Set(
-              (this.#writes.get(value.bindingId) ?? []).flatMap((w) =>
-                w.path.length === 1 ? w.path : [],
-              ),
+              available.flatMap((w) => (w.path.length === 1 ? w.path : [])),
             ),
           ];
     }
@@ -372,10 +415,12 @@ export class JavaScriptSymbolicBindings {
     if (value.kind === "record") return 0;
     if (value.kind === "namespace") {
       if (this.#mutated.has(value.bindingId)) return 1;
-      const replacement = this.#replacements.get(value.bindingId);
+      const replacement = this.#namespaceWrites(value).findLast(
+        (write) => write.path.length === 0,
+      );
       return replacement
         ? this.unknownMembers(
-            this.evaluate(replacement, value.environment),
+            this.evaluate(replacement.value, value.environment),
             active,
           )
         : 0;
@@ -646,22 +691,61 @@ export class JavaScriptSymbolicBindings {
     return { ...returned, environment };
   }
 
-  #moduleCompletionPoint(factory: t.Function): t.Node {
-    let earliestReturn: t.ReturnStatement | undefined;
-    // Use the shared traversal so source-sized child lists are pushed one at
-    // a time. Spreading array elements or call arguments overflows the stack.
-    traverseJavaScriptAst(factory.body, {
-      skip: (node) => t.isFunction(node) || t.isClass(node),
-      enter: (node) => {
-        if (
-          t.isReturnStatement(node) &&
-          (earliestReturn === undefined ||
-            (node.start ?? Infinity) < (earliestReturn.start ?? Infinity))
-        )
-          earliestReturn = node;
-      },
-    });
-    return earliestReturn ?? factory.body;
+  #namespaceWrites(value: SymbolicNamespace): readonly PropertyWrite[] {
+    const writes = this.#writes.get(value.bindingId) ?? [];
+    const completedAt = value.environment.completedAt;
+    return completedAt === undefined
+      ? writes
+      : writes.filter(
+          (write) =>
+            write.site.end != null &&
+            completedAt.end != null &&
+            write.site.end <= completedAt.end,
+        );
+  }
+
+  #completeNamespace(
+    value: SymbolicNamespace,
+    point: t.Node,
+  ): SymbolicNamespace {
+    return {
+      ...value,
+      environment: { ...value.environment, completedAt: point },
+    };
+  }
+
+  #moduleExports(value: SymbolicNamespace): SymbolicValue {
+    const factory = this.#namespaceOwners.get(value.bindingId);
+    if (factory === undefined) return value;
+    const cached = this.#completedModules.get(value.environment);
+    if (cached !== undefined) return cached;
+    if (this.#activeFunctions.has(factory))
+      return symbolicUnknown("recursive module completion");
+    this.#activeFunctions.add(factory);
+    try {
+      // Factory return values are ignored by the loader. Each reachable exit
+      // still owns a distinct initialization boundary and branch predicates.
+      const flow = this.#returnFlow(
+        t.isBlockStatement(factory.body) ? factory.body.body : [],
+        value.environment,
+        (statement) => this.#completeNamespace(value, statement),
+      );
+      const completed = symbolicUnion([
+        ...flow.values,
+        ...(flow.fallsThrough
+          ? [
+              this.#withConditions(
+                this.#completeNamespace(value, factory.body),
+                flow,
+              ),
+            ]
+          : []),
+      ]);
+      this.#completedModules.set(value.environment, completed);
+      return completed;
+    } finally {
+      this.#activeFunctions.delete(factory);
+    }
   }
 
   #call(
@@ -680,19 +764,8 @@ export class JavaScriptSymbolicBindings {
               ? (value.modules.get(String(key.value)) ??
                 symbolicUnknown("missing module"))
               : symbolicUnknown("dynamic module");
-          if (loaded.kind === "namespace") {
-            const factory = this.#namespaceOwners.get(loaded.bindingId);
-            result =
-              factory === undefined
-                ? loaded
-                : {
-                    ...loaded,
-                    environment: {
-                      ...loaded.environment,
-                      completedAt: this.#moduleCompletionPoint(factory),
-                    },
-                  };
-          } else result = loaded;
+          result =
+            loaded.kind === "namespace" ? this.#moduleExports(loaded) : loaded;
         } else if (
           value.kind === "external" &&
           value.path.join(".") === "require"
@@ -732,11 +805,7 @@ export class JavaScriptSymbolicBindings {
             this.#activeFunctions.delete(value.node);
           }
         }
-        for (const condition of value.conditions ?? [])
-          result = symbolicCondition(result, condition);
-        if (value.conditionUnresolved)
-          result = symbolicConditionsUnresolved(result);
-        return result;
+        return this.#withConditions(result, value);
       }),
     );
   }
@@ -745,11 +814,20 @@ export class JavaScriptSymbolicBindings {
     statements: readonly t.Statement[],
     env: SymbolicEnvironment,
   ): SymbolicValue {
-    const flow = this.#returnFlow(statements, env);
+    const flow = this.#returnFlow(statements, env, (statement) => {
+      const value = this.evaluate(statement.argument, env);
+      return symbolicUnion(
+        symbolicVariants(value).map((variant) =>
+          variant.kind === "function"
+            ? { ...variant, returnPoint: statement }
+            : variant,
+        ),
+      );
+    });
     return symbolicUnion([
       ...flow.values,
       ...(flow.fallsThrough
-        ? [{ kind: "literal" as const, value: undefined }]
+        ? [this.#withConditions({ kind: "literal", value: undefined }, flow)]
         : []),
     ]);
   }
@@ -757,19 +835,17 @@ export class JavaScriptSymbolicBindings {
   #returnFlow(
     statements: readonly t.Statement[],
     env: SymbolicEnvironment,
+    returnedValue: (statement: t.ReturnStatement) => SymbolicValue,
     depth = 0,
   ): SymbolicReturnFlow {
     const possible: SymbolicValue[] = [];
     let unresolvedFallthrough = false;
     const continuationConditions: SymbolicCondition[] = [];
-    const guardCurrentPath = (value: SymbolicValue): SymbolicValue => {
-      let guarded = value;
-      for (const condition of continuationConditions)
-        guarded = symbolicCondition(guarded, condition);
-      return unresolvedFallthrough
-        ? symbolicConditionsUnresolved(guarded)
-        : guarded;
-    };
+    const guardCurrentPath = (value: SymbolicValue): SymbolicValue =>
+      this.#withConditions(value, {
+        conditions: continuationConditions,
+        ...(unresolvedFallthrough ? { conditionUnresolved: true } : {}),
+      });
     for (const statement of statements) {
       if (--this.#remainingEvaluations < 0 || depth >= 128) {
         this.truncated = true;
@@ -784,24 +860,23 @@ export class JavaScriptSymbolicBindings {
           fallsThrough: false,
         };
       if (t.isReturnStatement(statement)) {
-        const value = this.evaluate(statement.argument, env);
-        const returned = symbolicUnion(
-          symbolicVariants(value).map((variant) =>
-            variant.kind === "function"
-              ? { ...variant, returnPoint: statement }
-              : variant,
-          ),
-        );
         return {
-          values: [...possible, guardCurrentPath(returned)],
+          values: [...possible, guardCurrentPath(returnedValue(statement))],
           fallsThrough: false,
         };
       }
       if (t.isBlockStatement(statement)) {
-        const flow = this.#returnFlow(statement.body, env, depth + 1);
+        const flow = this.#returnFlow(
+          statement.body,
+          env,
+          returnedValue,
+          depth + 1,
+        );
         possible.push(...flow.values.map(guardCurrentPath));
         if (!flow.fallsThrough)
           return { values: possible, fallsThrough: false };
+        continuationConditions.push(...(flow.conditions ?? []));
+        unresolvedFallthrough ||= flow.conditionUnresolved === true;
       }
       if (t.isIfStatement(statement)) {
         const truth = symbolicTruth(this.evaluate(statement.test, env));
@@ -810,7 +885,12 @@ export class JavaScriptSymbolicBindings {
             ? [statement.consequent, statement.alternate]
             : [truth ? statement.consequent : statement.alternate];
         const flows = branches.map((branch) =>
-          this.#returnFlow(branch ? [branch] : [], env, depth + 1),
+          this.#returnFlow(
+            branch ? [branch] : [],
+            env,
+            returnedValue,
+            depth + 1,
+          ),
         );
         possible.push(
           ...flows.flatMap((flow, index) =>
@@ -827,7 +907,10 @@ export class JavaScriptSymbolicBindings {
         );
         if (flows.every((flow) => !flow.fallsThrough))
           return { values: possible, fallsThrough: false };
-        if (truth === undefined) {
+        if (truth !== undefined) {
+          continuationConditions.push(...(flows[0]?.conditions ?? []));
+          unresolvedFallthrough ||= flows[0]?.conditionUnresolved === true;
+        } else {
           const fallthrough = flows.flatMap((flow, index) =>
             flow.fallsThrough ? [{ flow, index }] : [],
           );
@@ -866,7 +949,14 @@ export class JavaScriptSymbolicBindings {
         }
       }
     }
-    return { values: possible, fallsThrough: true };
+    return {
+      values: possible,
+      fallsThrough: true,
+      ...(continuationConditions.length
+        ? { conditions: continuationConditions }
+        : {}),
+      ...(unresolvedFallthrough ? { conditionUnresolved: true } : {}),
+    };
   }
 
   #indexBootstrap(call: t.CallExpression): void {
@@ -1047,10 +1137,6 @@ export class JavaScriptSymbolicBindings {
           return;
         }
       }
-    }
-    if (alias && selected.length === 0) {
-      this.#replacements.set(key, value);
-      return;
     }
     const writes = this.#writes.get(key) ?? [];
     writes.push({ path: selected, value, site });

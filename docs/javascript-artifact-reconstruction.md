@@ -363,6 +363,14 @@ conditions retain both return branches, including fallthrough. Short-circuit
 selection distinguishes truthiness from nullishness; uncertain `??` paths
 retain a nullish guard rather than a falsy guard.
 
+Recognized module factories retain a separate initialization boundary for each
+reachable return and for fallthrough. A conditional early return does not hide
+later exports on the continuing path; exports and captured initializers after a
+definite exit remain unavailable. Fallthrough candidates retain their branch
+predicates. Completed factory control flow is reused within that analysis only.
+Guarded main-process registrations remain candidate paths even with empty
+callbacks; they do not become unconditional IPC summary facts.
+
 These paths appear as contextual `javascript-expression` nodes. An exact `api`
 seed such as `desktop.copy` can trace an exposed member through a unique IPC
 pairing to an external API call. `addListener` is normalized to `on`. Semantic

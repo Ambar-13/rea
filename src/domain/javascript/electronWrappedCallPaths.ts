@@ -406,7 +406,23 @@ export const collectElectronWrappedCallPaths = (
       indexIpcFinding(ipcAtEndpoint(), value);
       if (descriptor.mode !== "send" && descriptor.mode !== "invoke" && !fn)
         accumulator.unknownFindings += 1;
-    } else if (findingGuarded) accumulator.unknownFindings += 1;
+    } else if (findingGuarded) {
+      accumulator.unknownFindings += 1;
+      // A guarded registration is a path candidate even when its callback has
+      // no observable body. Keep its predicate instead of promoting it to an
+      // unconditional IPC fact or dropping the registration entirely.
+      if (descriptor.side === "main")
+        emit(
+          {
+            ...channelContext,
+            entryKind: channelContext.entryKind ?? "ipc-handler",
+            entry: channelContext.entry || channel,
+          },
+          node,
+          endpoint,
+          channel,
+        );
+    }
     if (descriptor.mode === "send" || descriptor.mode === "invoke") {
       emit(channelContext, node, endpoint, channel);
       return;

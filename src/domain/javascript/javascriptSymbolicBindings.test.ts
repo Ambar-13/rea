@@ -1,4 +1,4 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import * as t from "@babel/types";
 import { parseJavaScriptSource } from "./javascriptSourceParser.js";
 import { indexJavaScriptBindingsSteps } from "./javascriptSemanticAnalysis.js";
@@ -314,6 +314,91 @@ it("does not treat statements after a returned module factory as initialized", (
     load(9);
   })();`);
   expect(result).toMatchObject({ kind: "unknown" });
+});
+
+it("retains the guard on a factory's completed fallthrough activation", () => {
+  const value = inspectOne(`(() => {
+    const modules = {
+      5(module, exports) {
+        { if (flag) return; }
+        const electron = require("electron");
+        exports.read = () => electron;
+      },
+      9(module, exports, load) { inspect(load(5).read()); }
+    };
+    function load(id) { const m={exports:{}}; modules[id](m,m.exports,load); return m.exports; }
+    load(9);
+  })();`);
+  const electron = symbolicVariants(value).filter(
+    (variant) => variant.kind === "external",
+  );
+  expect(electron).toHaveLength(1);
+  expect(electron[0]).toMatchObject({
+    path: ["electron"],
+    conditions: expect.arrayContaining([
+      {
+        node: expect.objectContaining({ type: "Identifier", name: "flag" }),
+        positive: false,
+      },
+    ]),
+  });
+  expect(
+    symbolicVariants(value).some((variant) => variant.kind === "unknown"),
+  ).toBe(true);
+});
+
+it("shares completed factory control flow across repeated loads within one analysis", () => {
+  const { parsed, resolver } = resolverFor(`(() => {
+    const modules = {
+      5(module, exports) { if (flag) return; exports.value = 42; },
+      9(module, exports, load) { ${"inspect(load(5));".repeat(64)} }
+    };
+    function load(id) { const m={exports:{}}; modules[id](m,m.exports,load); return m.exports; }
+    load(9);
+  })();`);
+  const evaluated = vi.spyOn(resolver, "evaluate");
+  const results: SymbolicValue[] = [];
+  traverseJavaScriptAst(parsed.program, {
+    enter: (node) => {
+      if (
+        t.isCallExpression(node) &&
+        t.isIdentifier(node.callee, { name: "inspect" })
+      )
+        results.push(resolver.evaluate(node.arguments[0]));
+    },
+  });
+  expect(results).toHaveLength(64);
+  expect(
+    results.every((result) =>
+      symbolicVariants(result).every(
+        (variant, index) => variant === symbolicVariants(results[0]!)[index],
+      ),
+    ),
+  ).toBe(true);
+  expect(
+    evaluated.mock.calls.filter(([node]) =>
+      t.isIdentifier(node, { name: "flag" }),
+    ),
+  ).toHaveLength(1);
+  expect(resolver.truncated).toBe(false);
+});
+
+it("bounds predicate expansion across many conditional factory exits", () => {
+  const { resolver, values } = inspectFixture(`(() => {
+    const modules = {
+      5(module, exports) { ${"if (flag) return;".repeat(1_600)} exports.value = 42; },
+      9(module, exports, load) { inspect(load(5)); }
+    };
+    function load(id) { const m={exports:{}}; modules[id](m,m.exports,load); return m.exports; }
+    load(9);
+  })();`);
+  expect(resolver.truncated).toBe(true);
+  expect(values.flatMap(symbolicVariants)).toContainEqual(
+    expect.objectContaining({
+      kind: "unknown",
+      reason: expect.stringContaining("resource limit"),
+    }),
+  );
 });
 
 it("treats known symbolic records and loaders as truthy", () => {
