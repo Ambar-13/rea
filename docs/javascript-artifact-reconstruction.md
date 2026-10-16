@@ -370,6 +370,9 @@ definite exit remain unavailable. Fallthrough candidates retain their branch
 predicates. Completed factory control flow is reused within that analysis only.
 Guarded main-process registrations remain candidate paths even with empty
 callbacks; they do not become unconditional IPC summary facts.
+Factory guards read export writes at their source position. Destructured and
+spread snapshots retain their capture position rather than reading later writes.
+An unproven namespace read boundary remains unknown.
 
 These paths appear as contextual `javascript-expression` nodes. An exact `api`
 seed such as `desktop.copy` can trace an exposed member through a unique IPC

@@ -49,6 +49,14 @@ interface SymbolicReturnFlow extends SymbolicMetadata {
   readonly values: readonly SymbolicValue[];
   readonly fallsThrough: boolean;
 }
+interface SymbolicPropertyRead {
+  readonly node: t.Node;
+  readonly environment: SymbolicEnvironment;
+}
+interface SymbolicReadBoundary {
+  readonly node: t.Node;
+  readonly edge: "start" | "end";
+}
 type SymbolicNamespace = Extract<SymbolicValue, { kind: "namespace" }>;
 
 const emptyEnvironment: SymbolicEnvironment = { values: new Map() };
@@ -229,29 +237,41 @@ export class JavaScriptSymbolicBindings {
     );
   }
 
-  property(value: SymbolicValue, key: string): SymbolicValue {
+  property(
+    value: SymbolicValue,
+    key: string,
+    read?: SymbolicPropertyRead,
+  ): SymbolicValue {
     let result: SymbolicValue;
     if (value.kind === "union")
       result = symbolicUnion(
-        value.values.map((variant) => this.property(variant, key)),
+        value.values.map((variant) => this.property(variant, key, read)),
       );
-    else result = this.#property(value, key);
+    else result = this.#property(value, key, read);
     return this.#withConditions(result, value);
   }
 
-  #property(value: SymbolicValue, key: string): SymbolicValue {
+  #property(
+    value: SymbolicValue,
+    key: string,
+    read?: SymbolicPropertyRead,
+  ): SymbolicValue {
     const active = this.#propertyActive.get(value) ?? new Set<string>();
     if (active.has(key)) return symbolicUnknown("cyclic property");
     active.add(key);
     this.#propertyActive.set(value, active);
     try {
-      return this.#propertyValue(value, key);
+      return this.#propertyValue(value, key, read);
     } finally {
       active.delete(key);
     }
   }
 
-  #propertyValue(value: SymbolicValue, key: string): SymbolicValue {
+  #propertyValue(
+    value: SymbolicValue,
+    key: string,
+    read?: SymbolicPropertyRead,
+  ): SymbolicValue {
     if (value.kind === "external") {
       const path = [...value.path, key];
       if (
@@ -270,7 +290,11 @@ export class JavaScriptSymbolicBindings {
         this.#unsafeExports.has(`${value.bindingId}:${key}`)
       )
         return symbolicUnknown("ambiguous export writes");
-      const available = this.#namespaceWrites(value);
+      const available = this.#namespaceWrites(value, read);
+      if (available === undefined) {
+        this.unresolved = true;
+        return symbolicUnknown("module export read boundary is unavailable");
+      }
       const replacement = available.findLast(
         (write) => write.path.length === 0,
       );
@@ -278,6 +302,7 @@ export class JavaScriptSymbolicBindings {
         return this.property(
           this.evaluate(replacement.value, value.environment),
           key,
+          read,
         );
       const writes = available.filter(
         (w) => w.path.length === 1 && w.path[0] === key,
@@ -328,7 +353,10 @@ export class JavaScriptSymbolicBindings {
       for (const p of [...value.node.properties].reverse()) {
         if (t.isSpreadElement(p)) {
           const spread = this.evaluate(p.argument, value.environment);
-          const found = this.property(spread, key);
+          const found = this.property(spread, key, {
+            node: p.argument,
+            environment: value.environment,
+          });
           if (found.kind !== "unknown") return found;
           if (
             this.unknownMembers(spread) > 0 ||
@@ -372,6 +400,7 @@ export class JavaScriptSymbolicBindings {
     if (value.kind === "record") return [...value.values.keys()];
     if (value.kind === "namespace") {
       const available = this.#namespaceWrites(value);
+      if (available === undefined) return [];
       const replacement = available.findLast(
         (write) => write.path.length === 0,
       );
@@ -415,7 +444,9 @@ export class JavaScriptSymbolicBindings {
     if (value.kind === "record") return 0;
     if (value.kind === "namespace") {
       if (this.#mutated.has(value.bindingId)) return 1;
-      const replacement = this.#namespaceWrites(value).findLast(
+      const available = this.#namespaceWrites(value);
+      if (available === undefined) return 1;
+      const replacement = available.findLast(
         (write) => write.path.length === 0,
       );
       return replacement
@@ -503,7 +534,10 @@ export class JavaScriptSymbolicBindings {
       const key = semanticStaticPropertyKey(node.property, node.computed);
       return key === null
         ? symbolicUnknown("dynamic member")
-        : this.property(this.evaluate(node.object, env), key);
+        : this.property(this.evaluate(node.object, env), key, {
+            node,
+            environment: env,
+          });
     }
     if (t.isSequenceExpression(node))
       return this.evaluate(node.expressions.at(-1), env);
@@ -595,7 +629,9 @@ export class JavaScriptSymbolicBindings {
       binding.initializers.length === 1 ? binding.initializers[0] : undefined;
     if (!initializer)
       return symbolicUnknown("missing or ambiguous initializer");
-    const point = this.#initializerReadPoint(binding.scopeId, env, node);
+    const boundary = this.#readBoundary(binding.scopeId, env, node);
+    const point =
+      boundary === undefined ? undefined : boundary.node[boundary.edge];
     if (
       !initializer.entryBody &&
       !binding.definitions.every(({ kind }) => kind === "function") &&
@@ -611,26 +647,29 @@ export class JavaScriptSymbolicBindings {
     let value = this.evaluate(initializer.node, env);
     for (const key of initializer.projection) {
       if (key === null) return symbolicUnknown("dynamic destructuring");
-      value = this.property(value, String(key));
+      value = this.property(value, String(key), {
+        node: initializer.node,
+        environment: env,
+      });
     }
     return value;
   }
 
-  #initializerReadPoint(
+  #readBoundary(
     bindingScopeId: string,
     environment: SymbolicEnvironment,
     readNode: t.Node,
-  ): number | undefined {
+  ): SymbolicReadBoundary | undefined {
     let current: SymbolicEnvironment | undefined = environment;
     let child: SymbolicEnvironment | undefined;
     while (current) {
       if (this.#scopeContains(bindingScopeId, current.scopeId)) {
         const point = child?.point ?? readNode;
         if (current.completedAt !== undefined)
-          return current.completedAt.end ?? undefined;
+          return { node: current.completedAt, edge: "end" };
         if (current.scopeNode && !this.#nodeWithin(point, current.scopeNode))
           return undefined;
-        return point.start ?? undefined;
+        return { node: point, edge: "start" };
       }
       child = current;
       current = current.parent;
@@ -638,7 +677,7 @@ export class JavaScriptSymbolicBindings {
     let outermost = environment;
     while (outermost.parent) outermost = outermost.parent;
     const point = outermost.point ?? environment.point ?? readNode;
-    return point.start ?? undefined;
+    return { node: point, edge: "start" };
   }
 
   #scopeContains(bindingScopeId: string, environmentScopeId?: string): boolean {
@@ -691,17 +730,50 @@ export class JavaScriptSymbolicBindings {
     return { ...returned, environment };
   }
 
-  #namespaceWrites(value: SymbolicNamespace): readonly PropertyWrite[] {
+  #namespaceReadBoundary(
+    value: SymbolicNamespace,
+    read: SymbolicPropertyRead,
+  ): SymbolicReadBoundary | undefined {
+    const scopeId = value.environment.scopeId;
+    if (scopeId === undefined) return undefined;
+    // Replaying a factory-owned initializer/spread reads at capture, even
+    // when a later closure observes it after the activation completed.
+    if (this.#owningFunction(read.node) === value.environment.scopeNode)
+      return { node: read.node, edge: "start" };
+    const boundary = this.#readBoundary(scopeId, read.environment, read.node);
+    if (boundary === undefined) return undefined;
+    // A fallback invocation point outside the owning factory cannot establish
+    // its active initialization state. Keep that read unknown.
+    return this.#owningFunction(boundary.node) === value.environment.scopeNode
+      ? boundary
+      : undefined;
+  }
+
+  #owningFunction(node: t.Node): t.Function | undefined {
+    let current: t.Node | undefined = node;
+    while (current !== undefined && !t.isFunction(current))
+      current = this.state.parentsByNode.get(current);
+    return current;
+  }
+
+  #namespaceWrites(
+    value: SymbolicNamespace,
+    read?: SymbolicPropertyRead,
+  ): readonly PropertyWrite[] | undefined {
     const writes = this.#writes.get(value.bindingId) ?? [];
     const completedAt = value.environment.completedAt;
-    return completedAt === undefined
-      ? writes
-      : writes.filter(
-          (write) =>
-            write.site.end != null &&
-            completedAt.end != null &&
-            write.site.end <= completedAt.end,
-        );
+    const boundary: SymbolicReadBoundary | undefined =
+      completedAt !== undefined
+        ? { node: completedAt, edge: "end" }
+        : read === undefined
+          ? undefined
+          : this.#namespaceReadBoundary(value, read);
+    if (boundary === undefined) return read === undefined ? writes : undefined;
+    const point = boundary.node[boundary.edge];
+    if (point == null) return undefined;
+    return writes.filter(
+      (write) => write.site.end != null && write.site.end <= point,
+    );
   }
 
   #completeNamespace(

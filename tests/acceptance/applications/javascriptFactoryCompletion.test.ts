@@ -27,6 +27,59 @@ const scenarios = [
   { name: "labeled-exit", guard: "exit: { return; }", candidate: false },
   { name: "with-exit", guard: "with ({}) { return; }", candidate: false },
   {
+    name: "export-guard",
+    guard: "exports.stop=true;if(exports.stop)return;exports.stop=false;",
+    candidate: false,
+  },
+  {
+    name: "module-guard",
+    guard:
+      "module.exports.stop=true;if(module.exports.stop)return;module.exports.stop=false;",
+    candidate: false,
+  },
+  {
+    name: "snapshot-guard",
+    guard:
+      "exports.stop=true;const {stop}=exports;exports.stop=false;if(stop)return;",
+    candidate: false,
+  },
+  {
+    name: "spread-guard",
+    guard:
+      "exports.stop=true;const saved={...exports};exports.stop=false;if(saved.stop)return;",
+    candidate: false,
+  },
+  {
+    name: "local-guard",
+    guard:
+      "exports.stop=true;function stop(){return exports.stop;}if(stop())return;exports.stop=false;",
+    candidate: false,
+  },
+  {
+    name: "argument-guard",
+    guard: "exports.stop=true;if(readStop(exports))return;exports.stop=false;",
+    candidate: false,
+  },
+  {
+    name: "false-export-guard",
+    guard: "exports.stop=false;if(exports.stop)return;exports.stop=true;",
+    candidate: true,
+  },
+  {
+    name: "loaded-spread-snapshot",
+    guard:
+      "exports.stop=true;const saved={...exports};exports.stop=false;exports.check=()=>saved.stop;",
+    callerGuard: "if(helper.check())return;",
+    candidate: false,
+  },
+  {
+    name: "loaded-destructured-snapshot",
+    guard:
+      "exports.stop=true;const {stop}=exports;exports.stop=false;exports.check=()=>stop;",
+    callerGuard: "if(helper.check())return;",
+    candidate: false,
+  },
+  {
     name: "export-after-exit",
     guard: "return;",
     candidate: false,
@@ -34,9 +87,14 @@ const scenarios = [
   },
 ] as const;
 
-const factorySource = (guard: string, bindingFirst: boolean) => {
+const factorySource = (
+  guard: string,
+  bindingFirst: boolean,
+  callerGuard = "",
+) => {
   const binding = "const electron = load(2);";
-  return `(() => {
+  return `function readStop(value) { return value.stop; }
+  (() => {
     const modules = {
       2(module) { module.exports = require("electron"); },
       5(module,exports,load) {
@@ -49,6 +107,7 @@ const factorySource = (guard: string, bindingFirst: boolean) => {
       },
       9(module,exports,load) {
         const helper = load(5);
+        ${callerGuard}
         helper.events.addListener("test:copy", () => {});
       }
     };
@@ -124,14 +183,15 @@ const verifyApplication = (
     status: "partial",
     truncated: false,
   });
+  const paths = result.graph.nodes
+    .flatMap((node) => node.observations)
+    .filter(
+      (observation) =>
+        observation.properties.terminal === "electron.ipcMain.addListener" &&
+        observation.properties.channel === "test:copy",
+    );
+  if (!candidate) expect(paths).toEqual([]);
   if (guarded) {
-    const paths = result.graph.nodes
-      .flatMap((node) => node.observations)
-      .filter(
-        (observation) =>
-          observation.properties.terminal === "electron.ipcMain.addListener" &&
-          observation.properties.channel === "test:copy",
-      );
     expect(paths.map((observation) => observation.properties)).toContainEqual(
       expect.objectContaining({
         resolution: "candidate",
@@ -155,7 +215,11 @@ cliTest(
     const { call } = await connectLocalToolsMcp();
     const contract = toolContract("analyze_javascript_application");
     for (const scenario of scenarios) {
-      const source = factorySource(scenario.guard, "bindingFirst" in scenario);
+      const source = factorySource(
+        scenario.guard,
+        "bindingFirst" in scenario,
+        "callerGuard" in scenario ? scenario.callerGuard : "",
+      );
       const directory = join(root, scenario.name);
       await mkdir(directory);
       await writeFile(join(directory, "main.js"), source);
@@ -198,5 +262,5 @@ cliTest(
       }
     }
   },
-  60_000,
+  120_000,
 );
