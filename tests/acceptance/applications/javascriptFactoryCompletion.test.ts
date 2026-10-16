@@ -24,6 +24,8 @@ const scenarios = [
   { name: "return", guard: "return;", candidate: false },
   { name: "both", guard: "if (flag) return; else return;", candidate: false },
   { name: "throw", guard: "throw new Error('stop');", candidate: false },
+  { name: "labeled-exit", guard: "exit: { return; }", candidate: false },
+  { name: "with-exit", guard: "with ({}) { return; }", candidate: false },
   {
     name: "export-after-exit",
     guard: "return;",

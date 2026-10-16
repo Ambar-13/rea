@@ -931,13 +931,11 @@ export class JavaScriptSymbolicBindings {
         }
       }
       if (
-        t.isWhileStatement(statement) ||
-        t.isDoWhileStatement(statement) ||
-        t.isForStatement(statement) ||
-        t.isForInStatement(statement) ||
-        t.isForOfStatement(statement) ||
+        t.isLoop(statement) ||
         t.isSwitchStatement(statement) ||
-        t.isTryStatement(statement)
+        t.isTryStatement(statement) ||
+        t.isLabeledStatement(statement) ||
+        t.isWithStatement(statement)
       ) {
         if (containsOwnedReturn(statement)) {
           possible.push(
